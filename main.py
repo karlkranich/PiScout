@@ -139,8 +139,14 @@ def build_display_lines(neighbor: dict, interface: str) -> list[str]:
         f"PORT: {_truncate(neighbor.get('port',       'Unknown'), 16)}",
         f"VLAN: {neighbor.get('vlan', 'Unknown')}",
         f"VOICE: {neighbor.get('voice_vlan', 'None')}",
-        _format_link_line(interface),
+        _my_ip_line(interface),
     ]
+
+
+def _my_ip_line(interface: str) -> str:
+    """MY IP line for the neighbor screens (address only, no prefix, to fit)."""
+    addr, _ = _local_ipv4(interface)
+    return f"MY IP: {addr.split('/')[0] if addr else 'no DHCP'}"
 
 
 def build_scanning_lines() -> list[str]:
@@ -153,9 +159,39 @@ def build_waiting_for_link_lines() -> list[str]:
     return ["", "", "Waiting for", "link...", ""]
 
 
-def build_stale_lines() -> list[str]:
-    """Shown when a previously seen neighbor has not re-advertised."""
-    return ["", "No active", "neighbor data.", "", ""]
+def _local_ipv4(interface: str) -> tuple[str, str]:
+    """Return (address/prefix, default gateway) on the interface, or ('', '')."""
+    import subprocess
+    addr = gw = ""
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", interface],
+                             capture_output=True, text=True, timeout=2).stdout
+        for tok_line in out.splitlines():
+            parts = tok_line.split()
+            if "inet" in parts:
+                addr = parts[parts.index("inet") + 1]
+                break
+        out = subprocess.run(["ip", "-4", "route", "show", "default", "dev", interface],
+                             capture_output=True, text=True, timeout=2).stdout
+        parts = out.split()
+        if "via" in parts:
+            gw = parts[parts.index("via") + 1]
+    except Exception as exc:
+        log.debug("Could not read local IP: %s", exc)
+    return addr, gw
+
+
+def build_stale_lines(interface: str = "") -> list[str]:
+    """Shown when no switch neighbor data is available: show our own IP instead."""
+    addr, gw = _local_ipv4(interface) if interface else ("", "")
+    return [
+        "No neighbor data",
+        f"MY IP: {addr or 'no DHCP'}",
+        f"GW: {gw or '--'}",
+        "",
+        "",
+        _format_link_line(interface) if interface else "",
+    ]
 
 
 def _show(display, lines: list[str], force: bool = False, protocol: str = "") -> bool:
@@ -388,10 +424,16 @@ def run() -> None:
         if result is None:
             # Discovery timed out with link still up.
             log.info("Discovery timed out on %s", interface)
-            _show(display, build_stale_lines(), force=True)
-            # Stay on stale screen until link drops.
+            stale_lines = build_stale_lines(interface)
+            _show(display, stale_lines, force=True)
+            # Stay on stale screen until link drops; redraw if our IP changes
+            # (e.g. DHCP answers late).
             while _read_carrier(interface) and not shutdown_event.is_set():
-                _wait_or_shutdown(shutdown_event, 1.0)
+                _wait_or_shutdown(shutdown_event, 5.0)
+                new_lines = build_stale_lines(interface)
+                if new_lines != stale_lines:
+                    stale_lines = new_lines
+                    _show(display, stale_lines, force=True)
             continue
 
         # ---- We have a result (may be partial) ----
@@ -493,7 +535,21 @@ def run() -> None:
         )
         refresh_thread.start()
 
+        last_ip_line  = _my_ip_line(interface)
+        last_ip_check = time.monotonic()
+
         while not shutdown_event.is_set():
+            # Redraw if our own address changes (e.g. LLDP answered before DHCP).
+            if displayed and not stale_shown and time.monotonic() - last_ip_check >= 5.0:
+                last_ip_check = time.monotonic()
+                ip_line = _my_ip_line(interface)
+                if ip_line != last_ip_line:
+                    last_ip_line = ip_line
+                    best = current_result[0]
+                    _show(display, build_display_lines(best, interface),
+                          force=True, protocol=best.get("protocol", ""))
+                    log.info("Local address changed | %s", ip_line)
+
             if not _read_carrier(interface):
                 log.info("Link lost on %s", interface)
                 refresh_cancel.set()
@@ -546,7 +602,7 @@ def run() -> None:
                     interface,
                     stale_elapsed,
                 )
-                _show(display, build_stale_lines(), force=True)
+                _show(display, build_stale_lines(interface), force=True)
                 stale_shown = True
 
             _wait_or_shutdown(shutdown_event, 1.0)
